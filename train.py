@@ -1,5 +1,5 @@
 import torch, os
-from dataset import load_data
+from AfriMMD.dataset import load_data
 from torch.utils.data import DataLoader, Dataset
 from torch import nn, optim
 from torch.optim.lr_scheduler import StepLR
