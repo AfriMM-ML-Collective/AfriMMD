@@ -7,7 +7,6 @@ from PIL import Image
 from torch import nn
 from transformers import AutoModel, AutoModelForSeq2SeqLM, AutoProcessor, AutoTokenizer
 
-
 # The tokenization method is `<tokens> <eos> <language code>` for source
 # language documents, and `<language code>
 # <tokens> <eos>` for target language documents.
@@ -17,12 +16,8 @@ class Tokenizer:
     """
     Tokenizer class
     """
-
     def __init__(self, target_lang: str):
-        self.image_processor, self.text_tokenizer = self.__load_from_huggingface(
-            target_lang
-        )
-
+        self.image_processor, self.text_tokenizer = self.__load_from_huggingface(target_lang)
         self.text_tokenizer.add_bos_token = False
         self.text_tokenizer.add_eos_token = False
 
@@ -31,17 +26,12 @@ class Tokenizer:
         Tokenize the image and text
         """
         pixel_values = self.image_processor(
-            images=image, return_tensors="pt"
-        ).pixel_values
+            images=image, return_tensors="pt").pixel_values
 
         inputs = self.text_tokenizer(
             text_target=text,
             return_tensors="pt",
-            return_attention_mask=True,
-            padding="max_length", 
-            truncation=True, 
-            max_length=60
-        )
+            return_attention_mask=True)
         return_data = {"pixel_values": pixel_values, **inputs}
         return return_data
 
@@ -53,10 +43,8 @@ class Tokenizer:
 
     def __load_from_huggingface(self, target_lang):
         siglip_image_processor = AutoProcessor.from_pretrained(
-            "google/siglip-base-patch16-256-multilingual"
-        ).image_processor
-        nllb_tokenizer = AutoTokenizer.from_pretrained(
-            "facebook/nllb-200-distilled-600M", tgt_lang=target_lang)
+            "google/siglip-base-patch16-256-multilingual").image_processor
+        nllb_tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M", tgt_lang=target_lang)
         return siglip_image_processor, nllb_tokenizer
 
 
@@ -74,10 +62,6 @@ class SiglipNllb(nn.Module):
         """
         Forward pass
         """
-        tokens['pixel_values'] = tokens['pixel_values'].squeeze(1)
-        tokens['input_ids'] = tokens['input_ids'].squeeze(1)
-        tokens['labels'] = tokens['labels'].squeeze(1)
-        # print(f"Shape of pixel_values in forward pass: {tokens['pixel_values'].shape}")
         image_features = self.vit(pixel_values=tokens["pixel_values"])
         image_features = self.connector(image_features.last_hidden_state)
 
@@ -102,15 +86,17 @@ class SiglipNllb(nn.Module):
 
 
 if __name__ == "__main__":
+    loss_fn = nn.CrossEntropyLoss()
     tokenizer = Tokenizer("yor_Latn")
-    image_ = Image.open("data/Images/3758787457_1a903ee1e9.jpg").convert(
-        "RGB"
-    )
-    tokenized_input= tokenizer(
-        image_, "Ajá aláwọ̀ búráwùn àti funfun kan ń ṣàn kọjá nínú yìnyín."
-    )
+    image_ = Image.open("data/Images/10815824_2997e03d76.jpg").convert("RGB")
+    tokenized_input= tokenizer(image_, "Ajá aláwọ̀ búráwùn àti funfun kan ń ṣàn kọjá nínú yìnyín.")
+    target_input_ids = tokenized_input["input_ids"]
     model = SiglipNllb()
     result = model(tokenized_input)
-    print(result)
+    models_output = model.generate("data/Images/10815824_2997e03d76.jpg")
+    print(models_output)
+    # logits = result.view(-1, result.size(-1))  
+    # targets = target_input_ids.view(-1)
+    # loss = loss_fn(logits, targets)
+    # print(f"Logits: {logits} Loss:, {loss.item()}")
 
-  
