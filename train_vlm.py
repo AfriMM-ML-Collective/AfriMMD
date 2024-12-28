@@ -1,20 +1,19 @@
 import wandb
 import torch
 from torch import nn
-from PIL import Image
+from typing import Dict
 from tqdm.auto import tqdm
-from typing import Dict, Any
-from siglip_nllb import SiglipNllb, Tokenizer
+import argparse, json, os, csv
+from datasets import load_dataset
+from siglip_nllb import SiglipNllb
+from dataset import DatasetProcessor
 from transformers import AdamW, get_scheduler
-import argparse, json, datetime, math, os, csv
-from datasets import load_dataset, DatasetDict
-from data_preprocessing import transform_dataset, data_collator, Tokenize_function
 
 def get_args_parser():
     parser = argparse.ArgumentParser('AFRIMMD Pretraining script', add_help=True)
     parser.add_argument('--batch-size', default=16, type=int)
     parser.add_argument('--epochs', default=80, type=int)
-    parser.add_argument('--device', default='mps', type=str)
+    parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--max_grad_norm', default=1.0, type=float)
     parser.add_argument('--warmup_steps', default=1000, type=int)
@@ -31,7 +30,6 @@ def compute_training_metrics(logits: torch.Tensor, targets: torch.Tensor, loss: 
     Compute pretraining-specific metrics
     """
     with torch.no_grad():
-        # Perplexity
         perplexity = torch.exp(loss)
         
         # Vision-Language alignment score (cosine similarity between vision and language features)
@@ -196,107 +194,82 @@ def evaluate(args, model, eval_dataloader):
     return eval_metrics
 
 def main(args):
-    # Initialize wandb if enabled
     if args.wandb_logging:
-        wandb.init(
-            project="afrimmd-pretraining",
-            config=vars(args),
-            dir=args.output_dir
-        )
+        wandb.init(project="afrimmd-pretraining", config=vars(args), dir=args.output_dir)
     
-    # Setup logging
     train_log_path, val_log_path = setup_logging(args.output_dir)
     
-    # Model initialization
     model = SiglipNllb()
     model.to(args.device)
     
-    # Freeze parts of the model for pretraining
+    # Freeze layers based on args
     if args.freeze_vision_encoder:
         for param in model.vit.parameters():
             param.requires_grad = False
     if args.freeze_language_decoder:
         for param in model.lm.parameters():
             param.requires_grad = False
-    
-    # Always keep connector layer trainable
     model.connector.requires_grad = True
     
-    # Data loading
+    # Process dataset
+    processor = DatasetProcessor()
     raw_data = load_dataset("AfriMM/AfriMMD")
-    raw_data = raw_data['train'].select(range(2))  # Remove this line when using script
-    data = transform_dataset(raw_data)
-    tokenized_data = data.map(Tokenize_function)
-    tokenized_data.set_format("pt", columns=["pixel_values", "input_ids", "attention_mask"])
+    raw_data = raw_data['train']
+    processed_data = processor.process(raw_data)
     
     # Create dataloaders
-    train_data = torch.utils.data.DataLoader(
-        tokenized_data["train"],
-        shuffle=True,
-        batch_size=args.batch_size,
-        collate_fn=data_collator
-    )
-    val_data = torch.utils.data.DataLoader(
-        tokenized_data["validation"],
-        batch_size=args.batch_size,
-        collate_fn=data_collator
-    )
-    test_data = torch.utils.data.DataLoader(
-        tokenized_data["test"],
-        batch_size=args.batch_size,
-        collate_fn=data_collator
-    )
+    dataloaders = {
+        'train': torch.utils.data.DataLoader(
+            processed_data["train"],
+            shuffle=True,
+            batch_size=args.batch_size,
+            collate_fn=processor.collate_batch
+        ),
+        'val': torch.utils.data.DataLoader(
+            processed_data["validation"],
+            batch_size=args.batch_size,
+            collate_fn=processor.collate_batch
+        ),
+        'test': torch.utils.data.DataLoader(
+            processed_data["test"],
+            batch_size=args.batch_size,
+            collate_fn=processor.collate_batch
+        )
+    }
     
-    # Optimization setup
     optimizer = AdamW(model.parameters(), lr=5e-5)
-    num_training_steps = args.epochs * len(train_data)
     lr_scheduler = get_scheduler(
         "linear",
         optimizer=optimizer,
         num_warmup_steps=args.warmup_steps,
-        num_training_steps=num_training_steps
+        num_training_steps=args.epochs * len(dataloaders['train'])
     )
     
     print(f"Starting SIGLIP and NLLB Pretraining on AFRIMMD dataset")
     print(f"Outputs will be saved to: {args.output_dir}")
     best_val_loss = float('inf')
     
-    # Training loop
     for epoch in range(args.epochs):
-        # Training
-        train_metrics, lr = train_one_epoch(args, model, train_data, epoch, optimizer, lr_scheduler)
-        
-        # Log training metrics
+        train_metrics, lr = train_one_epoch(args, model, dataloaders['train'], epoch, optimizer, lr_scheduler)
         log_metrics(train_log_path, epoch + 1, train_metrics, lr)
         
-        # Validation
-        val_metrics = evaluate(args, model, val_data)
-        
-        # Log validation metrics
+        val_metrics = evaluate(args, model, dataloaders['val'])
         log_metrics(val_log_path, epoch + 1, val_metrics)
         
-        # Logging
         print(f"\nEpoch {epoch+1} results:")
         print(f"Train metrics: {train_metrics}")
         print(f"Val metrics: {val_metrics}")
         
-        # Save best model if validation loss improved
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             save_checkpoint(args.output_dir, model, optimizer, epoch, val_metrics, is_best=True)
         
-        # Save last epoch model
         if epoch == args.epochs - 1:
             save_checkpoint(args.output_dir, model, optimizer, epoch, val_metrics, is_best=False)
     
-    # Final evaluation
     if args.eval:
-        test_metrics = evaluate(args, model, test_data)
-        print(f"Final test metrics: {test_metrics}")
-        
-        # Save test metrics
-        test_log_path = os.path.join(args.output_dir, 'test_metrics.json')
-        with open(test_log_path, 'w') as f:
+        test_metrics = evaluate(args, model, dataloaders['test'])
+        with open(os.path.join(args.output_dir, 'test_metrics.json'), 'w') as f:
             json.dump(test_metrics, f, indent=4)
 
 if __name__ == "__main__":
